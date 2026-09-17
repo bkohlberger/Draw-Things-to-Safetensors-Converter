@@ -7,8 +7,45 @@ import argparse
 from pathlib import Path
 import numpy as np
 
+# Draw Things writes .ckpt files through s4nnc / ccv. The high 32 bits of the
+# `type` column hold the codec identifier used to encode the `data` blob, and the
+# `datatype` column carries CCV_QX (0x40000) for palette-quantized tensors.
+# Identifiers taken from liuliu/s4nnc nnc/Store.swift.
+CODEC_IDENTIFIERS = {
+    0x217: "zip",
+    0x511: "ezm7",
+    0xF7217: "fpzip",
+    0x8A1E4B: "q4p",
+    0x8A1E5B: "q5p",
+    0x8A1E6B: "q6p",
+    0x8A1E7B: "q7p",
+    0x8A1E8B: "q8p",
+    0x8A1E9B: "i8x",
+    0x8A1EAB: "i8x (Q4_K)",
+    0x8A1EAC: "i8x (Q3_K)",
+    0x8A1EAD: "i8x (Q2_K)",
+    0x8A1EAE: "i8x (IQ2_S)",
+    0x8A1EAF: "i8x (IQ2_XS)",
+    0x8A1EB0: "i8x (IQ3_S)",
+    0x8A1EB1: "i8x (IQ3_XXS)",
+    0x8A1EB2: "i8x (IQ2_XXS)",
+    0x8A1EB3: "i8x (Q5_K)",
+    0x8A1EB4: "i8x (Q6_K)",
+}
+CCV_DATA_TYPE_MASK = 0xFF000
+CCV_QX = 0x40000
+# Bit 28 of the identifier means the bytes live in the sibling `<file>-tensordata`
+# file; the blob is then two little-endian uint64: offset and length.
+EXTERNAL_DATA_FLAG = 0x10000000
+CODEC_ID_MASK = 0x0FFFFFFF
+
 def convert_ckpt_to_safetensors(ckpt_file, overwrite=False, remove_ckpt=False, verbose=False):
-    """Convert a single Draw Things .ckpt file to .safetensors format."""
+    """Convert a single Draw Things .ckpt file to .safetensors format.
+
+    `remove_ckpt` is accepted for backwards compatibility but ignored: the
+    original file is never deleted because the conversion cannot be verified
+    as lossless. Returns True, "partial" (some tensors skipped) or False.
+    """
     print(f"\n{'='*60}")
     print(f"Converting: {ckpt_file}")
     print(f"{'='*60}")
@@ -58,6 +95,30 @@ def convert_ckpt_to_safetensors(ckpt_file, overwrite=False, remove_ckpt=False, v
         
         for idx, row in enumerate(rows):
             name, tensor_type, format_type, datatype, dim_blob, data_blob = row
+            
+            # Refuse encoded blobs instead of guessing. Draw Things compresses or
+            # quantizes most tensors (ezm7, fpzip, q6p/q8p, ...). Reinterpreting
+            # those bytes as raw floats produces garbage that still "converts".
+            identifier = ((tensor_type or 0) >> 32) & 0xFFFFFFFF
+            codec_id = identifier & CODEC_ID_MASK
+            is_external = bool(identifier & EXTERNAL_DATA_FLAG)
+            datatype_bits = (datatype or 0) & CCV_DATA_TYPE_MASK
+            if codec_id != 0 or is_external or datatype_bits == CCV_QX:
+                reasons = []
+                if codec_id != 0:
+                    reasons.append(f"encoded with {CODEC_IDENTIFIERS.get(codec_id, f'unknown codec 0x{codec_id:x}')}")
+                elif datatype_bits == CCV_QX:
+                    reasons.append("palette-quantized")
+                if is_external:
+                    reasons.append("bytes live in the external -tensordata file")
+                print(f"  Skipping '{name}': {'; '.join(reasons)}. This tool cannot decode it.")
+                quantized_tensors.append(name)
+                failed_tensors.append(name)
+                continue
+            if data_blob is None:
+                print(f"  Skipping '{name}': no inline data (probably stored in the external -tensordata file).")
+                failed_tensors.append(name)
+                continue
             
             # Clean up tensor name - remove Draw Things specific prefixes/suffixes
             # Draw Things might wrap names like "__text_model__[t-8-0]__up__"
@@ -286,10 +347,9 @@ def convert_ckpt_to_safetensors(ckpt_file, overwrite=False, remove_ckpt=False, v
         # Check if we have any tensors to save
         if not state_dict:
             if quantized_tensors and len(quantized_tensors) == len(rows):
-                print(f"  ✗ Error: This is a fully quantized model (q4p/q6p/q8p format).")
-                print(f"  All {len(rows)} tensors are quantized/compressed and cannot be converted.")
-                print(f"  Quantized models use compressed storage and are not supported by this converter.")
-                raise ValueError("Fully quantized model - no tensors can be extracted")
+                print(f"  ✗ Error: every tensor in this file is compressed or quantized.")
+                print(f"  All {len(rows)} tensors use a Draw Things codec (ezm7/fpzip/q6p/q8p/...) this converter cannot decode.")
+                raise ValueError("Fully encoded model - no tensors can be extracted")
             else:
                 raise ValueError("No tensors were successfully extracted from the .ckpt file")
         
@@ -399,14 +459,14 @@ def convert_ckpt_to_safetensors(ckpt_file, overwrite=False, remove_ckpt=False, v
             print(f"  Warning: Could not verify safetensors file: {e}")
             # Don't fail the conversion, but warn the user
         
+        # Deleting the source file is intentionally not supported: this tool cannot
+        # prove the output is a faithful copy, so the original must stay.
+        if failed_tensors:
+            print(f"⚠ Partial conversion: saved {len(state_dict)} of {len(rows)} tensors ({file_size / (1024*1024):.2f} MB)")
+            print(f"  The .safetensors file is NOT a faithful copy of the .ckpt. Keep the original.")
+            return "partial"
+        
         print(f"✓ Successfully converted! Saved {len(state_dict)} tensors ({file_size / (1024*1024):.2f} MB)")
-
-        
-        # Remove original .ckpt file if requested
-        if remove_ckpt:
-            os.remove(ckpt_file)
-            print(f"🗑️  Removed original .ckpt file")
-        
         return True
         
     except Exception as e:
@@ -524,8 +584,8 @@ Examples:
   # Convert a single file
   python convert_ckpt_to_safetensors.py --file "c:/models/my_lora.ckpt"
   
-  # Convert with overwrite and remove original
-  python convert_ckpt_to_safetensors.py --folder "c:/models" --overwrite --remove-ckpt
+  # Convert with overwrite
+  python convert_ckpt_to_safetensors.py --folder "c:/models" --overwrite
   
   # Convert with verbose output (show all tensor names)
   python convert_ckpt_to_safetensors.py --file "c:/models/my_lora.ckpt" --verbose
@@ -544,7 +604,8 @@ Examples:
     parser.add_argument('--overwrite', action='store_true', 
                        help='Overwrite existing .safetensors files')
     parser.add_argument('--remove-ckpt', action='store_true',
-                       help='Remove original .ckpt file after successful conversion')
+                       help='(disabled) Kept for compatibility. Originals are never deleted '
+                            'because the conversion cannot be verified as lossless.')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Show all tensor names during conversion (for debugging)')
     
@@ -593,11 +654,13 @@ Examples:
     # Display options
     print(f"Options:")
     print(f"  Overwrite existing: {args.overwrite}")
-    print(f"  Remove .ckpt after conversion: {args.remove_ckpt}")
+    if args.remove_ckpt:
+        print(f"  ⚠ --remove-ckpt is disabled: originals are never deleted")
     print(f"  Verbose mode: {args.verbose}")
     
     # Convert files
     successful = 0
+    partial = 0
     skipped = 0
     failed = 0
     
@@ -610,7 +673,9 @@ Examples:
         # Check if output file exists after conversion to distinguish skip vs failure
         file_exists_after = os.path.exists(output_file)
         
-        if result:
+        if result == "partial":
+            partial += 1
+        elif result:
             successful += 1
         elif file_exists_after and not args.overwrite:
             # File was skipped because it exists and overwrite is False
@@ -626,6 +691,7 @@ Examples:
     print(f"{'='*60}")
     print(f"Total files: {len(files_to_convert)}")
     print(f"✓ Successfully converted: {successful}")
+    print(f"⚠ Partial (tensors missing, keep originals): {partial}")
     print(f"⊘ Skipped (already exists): {skipped}")
     print(f"✗ Failed: {failed}")
 

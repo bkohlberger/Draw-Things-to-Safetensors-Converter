@@ -1,5 +1,16 @@
 # Draw Things to Safetensors Converter
 
+> ## ⚠️ Archived research. Do not rely on this tool.
+>
+> This was a November 2025 experiment and is no longer maintained. Before archiving it was checked against the real Draw Things on-disk format, and it does **not** solve the problem:
+>
+> - **Tensor names stay in Draw Things' internal scheme** (`__unet__[t-0-0]__down__`). ComfyUI, Automatic1111 and diffusers cannot load them. Mapping them back needs Draw Things' per-architecture model tables.
+> - **Most real Draw Things files are compressed or quantized** (ezm7, fpzip, q6p/q8p, or stored in an external `-tensordata` file). Those tensors are skipped with a message. Only plain float16/float32 tensors are written.
+> - **Draw Things exports natively.** The app can export LoRAs you trained to standard safetensors (SD 1.x/2.x, SDXL, SSD-1B, Flux.1, Flux.2 klein, Qwen Image, Z Image, ERNIE Image, Cosmos 2.5, per `FeaturesMatrix.swift` in [draw-things-community](https://github.com/drawthingsai/draw-things-community)). Use that instead.
+> - **`--remove-ckpt` is disabled.** Originals are never deleted.
+>
+> Kept public as a record of the SQLite layout, nothing more.
+
 A Python tool to convert Draw Things `.ckpt` model files back to standard `.safetensors` format for use with ComfyUI, Automatic1111, and other AI image generation tools.
 
 ## Background
@@ -10,9 +21,10 @@ Draw Things stores AI models in a proprietary SQLite-based `.ckpt` format that i
 
 - ✅ Batch convert all `.ckpt` files in a folder
 - ✅ Convert single files on demand
-- ✅ Configurable input/output folders via JSON config
+- ✅ Command-line interface (`--folder`, `--file`, `--inspect`)
 - ✅ Automatically skip already-converted files
-- ✅ Preserves tensor names, shapes, and data types
+- ✅ Preserves shapes and Draw Things' internal tensor names (not remapped)
+- ⛔ Compressed or quantized tensors are skipped, not decoded
 - ✅ Progress tracking for large conversions
 - ✅ Error handling with detailed reporting
 
@@ -73,8 +85,10 @@ python convert_ckpt_to_safetensors.py --file "c:/models/my_lora.ckpt"
 
 - **`--folder <path>`**: Convert all `.ckpt` files in folder (includes subfolders)
 - **`--file <path>`**: Convert a single `.ckpt` file
+- **`--inspect <path>`**: Show tensor names and metadata of an existing `.safetensors` file
 - **`--overwrite`**: Overwrite existing `.safetensors` files (optional)
-- **`--remove-ckpt`**: Remove original `.ckpt` file after successful conversion (optional)
+- **`--verbose`**: Print every tensor name during conversion (optional)
+- **`--remove-ckpt`**: Disabled. Accepted for compatibility, does nothing. Originals are never deleted.
 
 **Note:** You must use either `--folder` OR `--file`, not both.
 
@@ -95,16 +109,6 @@ python convert_ckpt_to_safetensors.py --file "c:/models/sdxl_lora.ckpt"
 python convert_ckpt_to_safetensors.py --folder "c:/models" --overwrite
 ```
 
-**Convert and remove original .ckpt files:**
-```bash
-python convert_ckpt_to_safetensors.py --folder "c:/models" --remove-ckpt
-```
-
-**Convert with both options:**
-```bash
-python convert_ckpt_to_safetensors.py --folder "c:/models" --overwrite --remove-ckpt
-```
-
 **Get help:**
 ```bash
 python convert_ckpt_to_safetensors.py --help
@@ -117,7 +121,7 @@ Default Draw Things model paths on macOS:
 - **LoRAs**: `~/Library/Containers/com.liuliu.draw-things/Data/Documents/Models/`
 - **Checkpoints**: Same directory as above
 
-Use these paths in your `input_folder` configuration.
+Use these paths with `--folder`.
 
 ## Output
 
@@ -132,46 +136,41 @@ Example output:
 ```
 Draw Things .ckpt to .safetensors Converter
 ============================================================
-
-Configuration:
-  Input folder: ./models
-  Output folder: ./converted_safetensors
-  Single file: None (convert all)
+Options:
   Overwrite existing: False
-
-Found 3 .ckpt file(s) to convert
+  Verbose mode: False
 
 ============================================================
-Converting: model_1.ckpt
+Converting: models/my_lora.ckpt
 ============================================================
-Found 2112 tensors
-  Processed 100/2112 tensors...
-  Processed 200/2112 tensors...
-  ...
-Saving to ./converted_safetensors/model_1.safetensors...
-✓ Successfully converted! Saved 2112 tensors
+Found 2 tensors
+  Skipping '__unet__[t-2-0]__': encoded with q8p. This tool cannot decode it.
+  ⚠ Warning: 1 tensor(s) are quantized/compressed and were skipped.
+
+Saving to models/my_lora.safetensors...
+⚠ Partial conversion: saved 1 of 2 tensors (0.03 MB)
+  The .safetensors file is NOT a faithful copy of the .ckpt. Keep the original.
 
 ============================================================
 CONVERSION SUMMARY
 ============================================================
-Total files: 3
-✓ Successfully converted: 3
+Total files: 1
+✓ Successfully converted: 0
+⚠ Partial (tensors missing, keep originals): 1
 ⊘ Skipped (already exists): 0
 ✗ Failed: 0
-
-Converted files saved to: ./converted_safetensors
 ```
 
 ## Troubleshooting
 
 ### "No .ckpt files found"
-- Check that your `input_folder` path is correct
+- Check that your `--folder` path is correct
 - Ensure the files have `.ckpt` extension
 - Verify you have read permissions for the folder
 
 ### "Error converting: [Errno 2] No such file or directory"
 - The input file path is incorrect
-- Check the `input_folder` setting in `converter_config.json`
+- Check the path passed to `--file` or `--folder`
 
 ### Import errors
 - Make sure PyTorch and safetensors are installed: `pip install torch safetensors`
@@ -179,30 +178,36 @@ Converted files saved to: ./converted_safetensors
 
 ### Memory issues with large models
 - The converter processes one tensor at a time to minimize memory usage
-- If you still encounter issues, try converting files one at a time using the `single_file` option
+- If you still encounter issues, try converting files one at a time using `--file`
 
 ## Technical Details
 
-Draw Things stores model weights in SQLite databases with the following structure:
+Draw Things stores model weights in SQLite databases written by [s4nnc](https://github.com/liuliu/s4nnc) / [ccv](https://github.com/liuliu/ccv):
 - **Table**: `tensors`
 - **Columns**: `name`, `type`, `format`, `datatype`, `dim` (shape), `data` (tensor bytes)
+- `type`: low 32 bits are the memory type, **high 32 bits are the codec identifier** of the `data` blob (0 = raw; `0x511` ezm7, `0xf7217` fpzip, `0x217` zip, `0x8a1e4b`..`0x8a1e8b` q4p..q8p, `0x8a1e9b`.. i8x). Bit `0x10000000` means the bytes live in `<file>-tensordata` and the blob is just two uint64: offset and length
+- `datatype`: low 32 bits are the ccv datatype (`0x20000` F16, `0x04000` F32, `0x40000` palette-quantized)
+- `dim`: 12 little-endian int32, trailing zeros unused
+- Tensors written with the `externalData` codec keep their bytes in a sibling `<file>.ckpt-tensordata` file
 
 The converter:
 1. Reads the SQLite database
-2. Extracts tensor metadata (name, dimensions, datatype)
-3. Infers PyTorch dtype from bytes-per-element
-4. Reconstructs tensors with correct shapes
+2. Skips any tensor whose codec identifier is non-zero or whose datatype is palette-quantized
+3. Infers PyTorch dtype from bytes-per-element (so integer tensors come out as floats)
+4. Reconstructs tensors with their shapes, keeping the internal names
 5. Saves using the safetensors library
 
 ## Limitations
 
-- Only works with Draw Things `.ckpt` files (SQLite format)
-- Cannot convert standard PyTorch `.ckpt` files (use other tools for that)
+- Output keeps Draw Things' internal tensor names, so other tools will not recognise the file
+- Compressed or quantized tensors (zip, ezm7, fpzip, q4p to q8p, i8x) and tensors kept in `-tensordata` files are skipped, not decoded
+- dtype is guessed from byte counts, so integer tensors are written as floats
+- Only works with Draw Things `.ckpt` files (SQLite format), not standard PyTorch `.ckpt` files
 - Requires enough disk space for both input and output files
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues or pull requests.
+This repository is archived and does not accept contributions. Fork it if you want to continue the research; the mapping tables in [draw-things-community](https://github.com/drawthingsai/draw-things-community) are the place to start.
 
 ## License
 
